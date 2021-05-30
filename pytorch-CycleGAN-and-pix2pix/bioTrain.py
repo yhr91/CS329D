@@ -33,11 +33,11 @@ import numpy as np
 def r(x):
     n, embedding_dim = x.shape
     image_dim = (embedding_dim + embedding_dim % 3) // 3
-    image_width = np.ceil(np.sqrt(image_dim))
+    image_width = int(np.ceil(np.sqrt(image_dim)))
     image_dim = (image_width)**2
     image = np.zeros((n, image_dim * 3))
     image[:, :embedding_dim] = x
-    image = image.shape(n, 3, image_width, image_width)
+    image = image.reshape(n, 3, image_width, image_width)
     return image
 
 if __name__ == '__main__':
