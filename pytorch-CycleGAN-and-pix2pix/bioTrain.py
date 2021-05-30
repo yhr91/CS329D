@@ -28,6 +28,17 @@ import anndata
 import scipy
 import torch
 from tqdm import tqdm
+import numpy as np
+
+def r(x):
+    n, embedding_dim = x.shape
+    image_dim = (embedding_dim + embedding_dim % 3) // 3
+    image_width = np.ceil(np.sqrt(image_dim))
+    image_dim = (image_width)**2
+    image = np.zeros((n, image_dim * 3))
+    image[:, :embedding_dim] = x
+    image = image.shape(n, 3, image_width, image_width)
+    return image
 
 if __name__ == '__main__':
     opt = TrainOptions().parse()   # get training options
@@ -43,9 +54,9 @@ if __name__ == '__main__':
     train_data = scipy.sparse.csr_matrix.toarray(train_adata.X)
     test_data = scipy.sparse.csr_matrix.toarray(test_adata.X)
     train_dataset = torch.utils.data.TensorDataset(torch.Tensor(train_data))
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size = 128, shuffle=True, num_workers = 4)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size = opt.batch_size, shuffle=True, num_workers = 4)
     test_dataset = torch.utils.data.TensorDataset(torch.Tensor(test_data))
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size = 128, shuffle=True, num_workers = 4)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size = opt.batch_size, shuffle=True, num_workers = 4)
 
     dataset_size = len(test_data)    # get the number of images in the dataset.
     print('The number of training images = %d' % dataset_size)
@@ -68,8 +79,8 @@ if __name__ == '__main__':
                 dataloader_iterator = iter(train_loader)
                 data2 = next(dataloader_iterator)
             data = {}
-            data['A'] = data1[0]
-            data['B'] = data2[0]
+            data['A'] = r(data1[0])
+            data['B'] = r(data2[0])
 
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:
