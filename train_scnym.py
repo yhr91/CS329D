@@ -2,33 +2,49 @@ import argparse
 import copy
 import json
 import os
+# plotting
+import sys
 # file downloads
 import urllib
 
 import anndata
 import numpy as np
 import scanpy as sc
-# plotting
-from scnym.api import scnym_api, CONFIGS
+import wandb
+
+sys.path.insert(0, "/afs/cs.stanford.edu/u/prabhat8/cs329d/scnym")
+from scnym.api import scnym_api, CONFIGS, scnym_tune
 
 CONFIGS['no_ssl'] = copy.deepcopy(CONFIGS['default'])
+CONFIGS['no_ssl']['ssl_method'] = 'sup_only'
 CONFIGS['no_ssl']['ssl_kwargs']['dan_max_weight'] = 0.0
 CONFIGS['no_ssl']['ssl_kwargs']['dan_ramp_epochs'] = 1
+CONFIGS['no_ssl']['ssl_kwargs']['dan_criterion'] = None
 CONFIGS['no_ssl']['unsup_max_weight'] = 0.0
 CONFIGS['no_ssl']['description'] = (
-    'Train scNym models with MixMatch but no domain adversary. May be useful if class imbalance is very large.'
+    'Train scNym models no SSL'
 )
+
 CONFIGS['only_dan'] = copy.deepcopy(CONFIGS['default'])
+CONFIGS['only_dan']['mixup_alpha'] = None
+CONFIGS['only_dan']['ssl_method'] = 'sup_only'
 CONFIGS['only_dan']['unsup_max_weight'] = 0.0
 CONFIGS['only_dan']['description'] = (
-    'Train scNym models with only domain adversary. '
+    'Train scNym models with only domain adversary.'
+)
+
+CONFIGS['no_dan'] = copy.deepcopy(CONFIGS['default'])
+CONFIGS['no_dan']['ssl_kwargs']['dan_max_weight'] = 0.0
+CONFIGS['no_dan']['ssl_kwargs']['dan_ramp_epochs'] = 1
+CONFIGS['no_dan']['ssl_kwargs']['dan_criterion'] = None
+CONFIGS['no_dan']['description'] = (
+    'Train scNym models with MixMatch but no domain adversary. May be useful if class imbalance is very large.'
 )
 
 
 def get_data_tm(basedir):
-
-    train_adata = anndata.read_h5ad('/dfs/project/CS329D/data/mouse_mca_lung_log1p_cpm.h5ad', )
-    target_adata = anndata.read_h5ad('/dfs/project/CS329D/data/mouse_tabula_muris_10x_log1p_cpm.h5ad', )
+    train_adata = anndata.read_h5ad('/dfs/project/CS329D/data/mouse_tabula_muris_10x_log1p_cpm.h5ad', )
+    target_adata = anndata.read_h5ad('/dfs/project/CS329D/data/mouse_mca_lung_log1p_cpm.h5ad', )
 
     train_adata.obs['annotations'] = np.array(
         train_adata.obs['cell_ontology_class']
@@ -43,8 +59,28 @@ def get_data_tm(basedir):
     return adata
 
 
-def get_data_rat(basedir):
+def get_data_hb(basedir):
+    adata = sc.read_h5ad('/dfs/project/CS329D/data/kang_2017_stim_pbmc.h5ad')
+    train_adata = adata[adata.obs['stim'] == 'ctrl']
+    target_adata = adata[adata.obs['stim'] == 'stim']
 
+    train_adata.obs['annotations'] = np.array(
+        train_adata.obs['cell']
+    )
+    target_adata.obs['annotations'] = 'Unlabeled'
+
+    adata = train_adata.concatenate(target_adata)
+    # adata = train_adata
+    print('%d cells, %d genes in the joined training and target set.' % adata.shape)
+
+    # save genes used in the model
+    np.savetxt(f'{basedir}/model_genes.csv', train_adata.var_names, fmt='%s')
+    model_genes = np.loadtxt(f'{basedir}/model_genes.csv', dtype='str')
+
+    return adata
+
+
+def get_data_rat(basedir):
     cell_atlas_json_url = 'https://storage.googleapis.com/calico-website-scnym-storage/link_tables/cell_atlas.json'
     urllib.request.urlretrieve(
         cell_atlas_json_url,
@@ -114,23 +150,41 @@ def get_data(basedir, dataset):
         return get_data_rat(path)
     elif dataset == 'tm':
         return get_data_tm(path)
+    elif dataset == 'hb':
+        return get_data_hb(path)
     else:
         raise ValueError(f"Unknown dataset: {dataset}")
 
 
 def train(adata, basedir, config):
-    scnym_api(
+    # scnym_api(
+    #     adata=adata,
+    #     task='train',
+    #     groupby='annotations',
+    #     out_path=f'{basedir}/scnym_outputs_{config}',
+    #     config=config,
+    # )
+
+    scnym_tune(
         adata=adata,
-        task='train',
         groupby='annotations',
+        base_config=config,
         out_path=f'{basedir}/scnym_outputs_{config}',
-        config=config,
+        parameters={
+            "unsup_max_weight": [1.],
+        },
+        search="grid",
+        n_splits=5
     )
 
 
 def get_acc(data, key):
-    return np.sum(np.array(data.obs[key].values) == np.array(data.obs['cell_ontology_class'].values)) / \
-           len(data)
+    if 'cell_ontology_class' in data.obs:
+        return np.sum(np.array(data.obs[key].values) == np.array(data.obs['cell_ontology_class'].values)) / \
+               len(data)
+    else:
+        return np.sum(np.array(data.obs[key].values) == np.array(data.obs['cell'].values)) / \
+               len(data)
 
 
 def evaluate(basedir, adata, config):
@@ -149,6 +203,7 @@ def evaluate(basedir, adata, config):
 
 
 def main(args):
+    # wandb.init(sync_tensorboard=True, config=args, dir='/dfs/scratch2/prabhat8/wandb')
     adata = get_data(os.path.join(args.basedir, 'dataset'), args.dataset)
     train(adata, os.path.join(args.basedir, 'models', args.dataset), args.config)
     evaluate(os.path.join(args.basedir, 'models', args.dataset), adata, args.config)
