@@ -38,7 +38,7 @@ def r(x):
     image = torch.zeros((n, image_dim * 3))
     image[:, :embedding_dim] += x
     image = image.reshape(n, 3, image_width, image_width)
-    
+    image = torch.nn.functional.pad(input=image, pad=(1, 1, 1, 1))
     return image
 
 if __name__ == '__main__':
@@ -82,6 +82,7 @@ if __name__ == '__main__':
             data = {}
             data['A'] = r(data1[0])
             data['B'] = r(data2[0])
+            # print(data['B'].shape == data['A'].shape, 'A shape:', data['A'].shape, 'B shape:', data['B'].shape)
 
             iter_start_time = time.time()  # timer for computation per iteration
             if total_iters % opt.print_freq == 0:
