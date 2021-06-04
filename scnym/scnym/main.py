@@ -375,7 +375,7 @@ def fit_model(
         'save_freq': max(n_epochs // 5, 1) if save_freq is None else save_freq,
         'reg_criterion': None,
         'exp_name': osp.basename(out_path),
-        'verbose': True,
+        'verbose': False,
         'tb_writer': osp.join(out_path, 'tblog') if tensorboard else None,
         'patience': patience,
     }

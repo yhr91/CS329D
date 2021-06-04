@@ -1249,7 +1249,7 @@ def sharpen_labels(
 class OnlySupLoss(object):
     def __init__(self, criterion):
         self.criterion= criterion
-        self.running_confidence_scores = [[0]]
+        self.running_confidence_scores = [[torch.zeros(1), torch.zeros(1)]]
 
     def __call__(self,
                  model: nn.Module,
