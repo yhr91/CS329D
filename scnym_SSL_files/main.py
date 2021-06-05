@@ -1,28 +1,31 @@
 '''Train scNym models and identify cell type markers'''
-import itertools
-import os
-import os.path as osp
-from functools import partial
-from typing import Union
-
 import numpy as np
 import pandas as pd
+from scipy import sparse
+import os
+import os.path as osp
 import scanpy as sc
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from scipy import sparse
-from sklearn.model_selection import StratifiedKFold
 from torch.utils.data import DataLoader
+from sklearn.model_selection import StratifiedKFold
+from typing import Union
+import copy
+import itertools
+from functools import partial
 
-from . import utils
-from .dataprep import AUGMENTATION_SCHEMES
-from .dataprep import SingleCellDS, SampleMixUp
 from .model import CellTypeCLF, CellTypeCLFConditional
-from .predict import Predicter
-from .trainer import InterpolationConsistencyLoss, ICLWeight, MixMatchLoss, DANLoss, OnlySupLoss
+
+from .dataprep import SingleCellDS, SampleMixUp, balance_classes
+from .dataprep import AUGMENTATION_SCHEMES
 from .trainer import Trainer, SemiSupervisedTrainer
 from .trainer import cross_entropy, get_class_weight
+from .trainer import InterpolationConsistencyLoss, ICLWeight, MixMatchLoss, DANLoss
+
+from .predict import Predicter
+from . import utils
 
 # define optimizer map for cli selection
 OPTIMIZERS = {
@@ -31,7 +34,6 @@ OPTIMIZERS = {
     'adamw': torch.optim.AdamW,
     'sgd': torch.optim.SGD,
 }
-
 
 #########################################################
 # Train scNym classification models
@@ -62,33 +64,39 @@ def repeater(data_loader):
 
 
 def fit_model(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        y: np.ndarray,
-        traintest_idx: Union[np.ndarray, tuple],
-        val_idx: np.ndarray,
-        batch_size: int,
-        n_epochs: int,
-        lr: float,
-        optimizer_name: str,
-        weight_decay: float,
-        ModelClass: nn.Module,
-        out_path: str,
-        n_genes: int = None,
-        mixup_alpha: float = None,
-        unlabeled_counts: np.ndarray = None,
-        unsup_max_weight: float = 2.,
-        unsup_mean_teacher: bool = False,
-        ssl_method: str = 'mixmatch',
-        ssl_kwargs: dict = {},
-        weighted_classes: bool = False,
-        balanced_classes: bool = False,
-        input_domain: np.ndarray = None,
-        unlabeled_domain: np.ndarray = None,
-        pretrained: str = None,
-        patience: int = None,
-        save_freq: int = None,
-        tensorboard: bool = True,
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    y: np.ndarray,
+    coarse_X,
+    coarse_y: np.ndarray,
+    coarse_map: dict,
+    traintest_idx: Union[np.ndarray, tuple],
+    coarse_traintest_idx,
+    val_idx: np.ndarray,
+    coarse_val_idx,
+    batch_size: int,
+    n_epochs: int,
+    lr: float,
+    optimizer_name: str,
+    weight_decay: float,
+    ModelClass: nn.Module,
+    out_path: str,
+    n_genes: int = None,
+    mixup_alpha: float = None,
+    unlabeled_counts: np.ndarray = None,
+    unlabeled_labels: np.ndarray = None,
+    unsup_max_weight: float = 2.,
+    unsup_mean_teacher: bool = False,
+    ssl_method: str='mixmatch',
+    ssl_kwargs: dict={},
+    weighted_classes: bool = False,
+    balanced_classes: bool = False,
+    input_domain: np.ndarray=None,
+    unlabeled_domain: np.ndarray=None,
+    pretrained: str=None,
+    patience: int=None,
+    save_freq: int=None,
+    tensorboard: bool=True,
+    **kwargs,
 ) -> (float, float):
     '''Fit an scNym model given a set of observations and labels.
     
@@ -167,28 +175,32 @@ def fit_model(
     '''
     # count the number of cell types available
     n_cell_types = len(np.unique(y))
+    n_coarse_cell_types = len(np.unique(coarse_y))
     if n_genes is None:
         n_genes = X.shape[1]
-
+        
     if type(traintest_idx) != tuple:
         # Set aside 10% of the traintest data for model selection in `test_idx`
         train_idx = np.random.choice(
             traintest_idx,
-            size=int(
-                np.floor(0.9 * len(traintest_idx))),
-            replace=False,
+             size=int(
+                 np.floor(0.9 * len(traintest_idx))),
+             replace=False,
         ).astype('int')
         test_idx = np.setdiff1d(traintest_idx, train_idx).astype('int')
     elif type(traintest_idx) == tuple and len(traintest_idx) == 2:
         # use the user provided train/test split
         train_idx = traintest_idx[0]
-        test_idx = traintest_idx[1]
+        test_idx  = traintest_idx[1]
+
+        coarse_train_idx = corase_traintest_idx[0]
+        coarse_test_idx  = coarse_traintest_idx[1]
     else:
         # the user supplied an invalid argument
         msg = '`traintest_idx` of type {type(traintest_idx)}\n'
         msg += 'and length {len(traintest_idx)} is invalid.'
         raise ValueError(msg)
-
+        
     # save indices to CSVs for later retrieval
     np.savetxt(osp.join(out_path, 'train_idx.csv'), train_idx)
     np.savetxt(osp.join(out_path, 'test_idx.csv'), test_idx)
@@ -206,14 +218,14 @@ def fit_model(
         # we use the inverse of the class count as a weight
         # this is normalized in `WeightedRandomSample`
         classes, counts = np.unique(y[train_idx], return_counts=True)
-        sample_weights = 1. / counts
-
+        sample_weights = 1./counts
+        
         # `WeightedRandomSampler` is kind of funny and takes a weight
         # **per example** in the training set, rather than per class.
         # here we assign the appropriate class weight to each sample
         # in the training set.
         weight_per_example = sample_weights[y[train_idx]]
-
+        
         # we instantiate the sampler with the relevant weight for
         # each observation and set the number of total samples to the
         # number of samples in our training set
@@ -221,7 +233,7 @@ def fit_model(
         # with probabilities computed from the normalized vector
         # of `weights_per_example`.
         sampler = torch.utils.data.sampler.WeightedRandomSampler(
-            weight_per_example,
+            weight_per_example, 
             len(y[train_idx]),
         )
         class_weight = None
@@ -246,7 +258,7 @@ def fit_model(
 
     X_test = X[test_idx, :]
     y_test = y[test_idx]
-
+    
     # count the number of domains
     if (input_domain is None) and (unlabeled_domain is None):
         n_domains = 2
@@ -258,27 +270,35 @@ def fit_model(
         msg = 'domains supplied for only one set of data'
         raise ValueError(msg)
     print(f'Found {n_domains} unique domains.')
-
+    
     if input_domain is not None:
         d_train = input_domain[train_idx]
-        d_test = input_domain[test_idx]
+        d_test  = input_domain[test_idx]
     else:
         d_train = None
-        d_test = None
+        d_test  = None
 
+    # TODO
     train_ds = SingleCellDS(
         X=X_train,
         y=y_train,
         num_classes=len(np.unique(y)),
-        domain=d_train,
-        num_domains=n_domains,
+        domain = d_train,
+        num_domains = n_domains,
     )
     test_ds = SingleCellDS(
         X_test,
         y_test,
         num_classes=len(np.unique(y)),
-        domain=d_test,
-        num_domains=n_domains,
+        domain = d_test,
+        num_domains = n_domains,
+    )
+    coarse_ds = SingleCellDS(
+        X=coarse_X,
+        y=coarse_y,
+        num_classes=len(np.unique(coarse_y)),
+        domain = d_train,
+        num_domains = n_domains,
     )
 
     train_dl = DataLoader(
@@ -293,10 +313,16 @@ def fit_model(
         batch_size=batch_size,
         shuffle=True,
     )
+    coarse_dl = DataLoader(
+        coarse_ds,
+        batch_size=batch_size,
+        shuffle=True,
+    )
 
     dataloaders = {
         'train': train_dl,
         'val': test_dl,
+        'coarse': coarse_dl
     }
 
     # Define batch transformers
@@ -309,9 +335,10 @@ def fit_model(
     model = ModelClass(
         n_genes=n_genes,
         n_cell_types=n_cell_types,
+        n_coarse_cell_types=n_coarse_cell_types,
         **kwargs,
     )
-
+    
     if pretrained is not None:
         # initialize with supplied weights
         model.load_state_dict(
@@ -320,7 +347,7 @@ def fit_model(
                 map_location='cpu',
             )
         )
-
+    
     if torch.cuda.is_available():
         model = model.cuda()
 
@@ -335,9 +362,9 @@ def fit_model(
             cross_entropy,
             class_weight=torch.from_numpy(class_weight).float(),
         )
-
+        
     opt_callable = OPTIMIZERS[optimizer_name.lower()]
-
+    
     if opt_callable != torch.optim.SGD:
         optimizer = opt_callable(
             model.parameters(),
@@ -357,8 +384,9 @@ def fit_model(
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer=optimizer,
             T_max=n_epochs,
-            eta_min=lr / 10000,
+            eta_min=lr/10000,
         )
+        
 
     # Build the relevant trainer object for either supervised
     # or semi-supervised learning with interpolation consistency
@@ -371,12 +399,12 @@ def fit_model(
         'out_path': out_path,
         'batch_transformers': batch_transformers,
         'n_epochs': n_epochs,
-        'min_epochs': n_epochs // 20,
-        'save_freq': max(n_epochs // 5, 1) if save_freq is None else save_freq,
+        'min_epochs': n_epochs//20,
+        'save_freq': max(n_epochs//5, 1) if save_freq is None else save_freq,
         'reg_criterion': None,
         'exp_name': osp.basename(out_path),
         'verbose': False,
-        'tb_writer': osp.join(out_path, 'tblog') if tensorboard else None,
+        'tb_writer' : osp.join(out_path, 'tblog') if tensorboard else None,
         'patience': patience,
     }
 
@@ -384,15 +412,17 @@ def fit_model(
         # perform fully supervised training
         T = Trainer(**trainer_kwargs)
     else:
+        # TODO reverse
         # perform semi-supervised training
         unsup_dataset = SingleCellDS(
             X=unlabeled_counts,
-            y=np.zeros(unlabeled_counts.shape[0]),
+            #y=np.zeros(unlabeled_counts.shape[0]),
+            y=unlabeled_labels,
             num_classes=len(np.unique(y)),
             domain=unlabeled_domain,
             num_domains=n_domains,
         )
-
+        
         # Build a semi-supervised data loader that infinitely samples
         # unsupervised data for interpolation consistency.
         # This allows us to loop through the labeled data iterator
@@ -406,13 +436,8 @@ def fit_model(
         unsup_dataloader = repeater(unsup_dataloader)
 
         # Set up the unsupervised loss
-        if ssl_method.lower() == 'sup_only':
-            print("Using supervised loss only")
-            USL = OnlySupLoss(
-                criterion=criterion
-            )
-        elif ssl_method.lower() == 'ict':
-            print('Using ICT for semi-supervised learning')
+        if ssl_method.lower() == 'ict':
+            print('Using ICT for semi-supervised learning')                
             USL = InterpolationConsistencyLoss(
                 alpha=mixup_alpha if mixup_alpha is not None else 0.3,
                 unsup_criterion=nn.MSELoss(),
@@ -457,10 +482,10 @@ def fit_model(
         # ("burn_in_epochs") before we start the ramp up, and a maximum
         # coefficient value
         weight_schedule = ICLWeight(
-            ramp_epochs=ssl_kwargs.get('ramp_epochs', max(n_epochs // 4, 1)),
+            ramp_epochs=ssl_kwargs.get('ramp_epochs', max(n_epochs//4, 1)),
             max_unsup_weight=unsup_max_weight,
-            burn_in_epochs=ssl_kwargs.get('burn_in_epochs', 20),
-            sigmoid=ssl_kwargs.get('sigmoid', False),
+            burn_in_epochs = ssl_kwargs.get('burn_in_epochs', 20),
+            sigmoid = ssl_kwargs.get('sigmoid', False),
         )
         # don't let early stopping save checkpoints from before the SSL 
         # ramp up has started
@@ -468,36 +493,36 @@ def fit_model(
             trainer_kwargs['min_epochs'],
             weight_schedule.burn_in_epochs + weight_schedule.ramp_epochs // 5,
         )
-
+        
         # if min_epochs are manually specified, use that number instead
         if ssl_kwargs.get('min_epochs', None) is not None:
             trainer_kwargs['min_epochs'] = ssl_kwargs['min_epochs']
-
+        
         # let the model save weights even if the ramp is 
         # longer than the total epochs we'll train for
         trainer_kwargs['min_epochs'] = min(
             trainer_kwargs['min_epochs'],
-            trainer_kwargs['n_epochs'] - 1,
+            trainer_kwargs['n_epochs']-1,
         )
-
+        
         dan_criterion = ssl_kwargs.get('dan_criterion', None)
         if dan_criterion is not None:
             # initialize the DAN Loss
-
+            
             dan_criterion = DANLoss(
                 model=model,
                 dan_criterion=cross_entropy,
                 use_conf_pseudolabels=ssl_kwargs.get('dan_use_conf_pseudolabels', False),
                 scale_loss_pseudoconf=ssl_kwargs.get('dan_scale_loss_pseudoconf', False),
-                n_domains=n_domains,
+                n_domains = n_domains,
             )
 
             # setup the DANN learning rate schedule
             dan_weight = ICLWeight(
-                ramp_epochs=ssl_kwargs.get('dan_ramp_epochs', max(n_epochs // 4, 1)),
+                ramp_epochs=ssl_kwargs.get('dan_ramp_epochs', max(n_epochs//4, 1)),
                 max_unsup_weight=ssl_kwargs.get('dan_max_weight', 1.),
-                burn_in_epochs=ssl_kwargs.get('dan_burn_in_epochs', 0),
-                sigmoid=ssl_kwargs.get('sigmoid', True),
+                burn_in_epochs = ssl_kwargs.get('dan_burn_in_epochs', 0),
+                sigmoid = ssl_kwargs.get('sigmoid', True),
             )
             # add DANN parameters to the optimizer
             optimizer.add_param_group({
@@ -507,6 +532,7 @@ def fit_model(
         else:
             dan_weight = None
 
+        #TODO
         # initialize the trainer
         T = SemiSupervisedTrainer(
             unsup_dataloader=unsup_dataloader,
@@ -514,6 +540,7 @@ def fit_model(
             unsup_weight=weight_schedule,
             dan_criterion=dan_criterion,
             dan_weight=dan_weight,
+            coarse_map=coarse_map,
             **trainer_kwargs,
         )
 
@@ -528,6 +555,7 @@ def fit_model(
     model = ModelClass(
         n_genes=n_genes,
         n_cell_types=n_cell_types,
+        n_coarse_cell_types = n_coarse_cell_types,
         **kwargs,
     )
     model.load_state_dict(
@@ -544,14 +572,14 @@ def fit_model(
     X_val = X[val_idx, :]
     y_val = y[val_idx]
     val_ds = SingleCellDS(
-        X_val,
+        X_val, 
         y_val,
-        num_classes=len(np.unique(y)),
+        num_classes=len(np.unique(y)),            
     )
     val_dl = DataLoader(
-        val_ds,
-        batch_size=batch_size,
-        shuffle=False,
+        val_ds, 
+        batch_size=batch_size, 
+        shuffle=False, 
     )
 
     # Without recording any gradients to speed things up,
@@ -576,11 +604,11 @@ def fit_model(
 
             # Perform forward pass and compute predictions as the
             # most likely class
-            output = model(input_)
+            output = model(input_)[0]
             _, predictions = torch.max(output, 1)
 
             corrects = torch.sum(
-                predictions.detach() == int_label_.detach(),
+                predictions.detach()== int_label_.detach(),
             )
 
             l = criterion(output, label_)
@@ -598,7 +626,7 @@ def fit_model(
             )
 
         norm_loss = loss / len(val_dl)
-        acc = running_corrects / running_total
+        acc = running_corrects/running_total
         print('EVAL LOSS: ', norm_loss)
         print('EVAL ACC : ', acc)
 
@@ -618,26 +646,26 @@ def fit_model(
 
 
 def train_cv(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        y: np.ndarray,
-        batch_size: int,
-        n_epochs: int,
-        lr: float,
-        optimizer_name: str,
-        weight_decay: float,
-        ModelClass: nn.Module,
-        fold_indices: list,
-        out_path: str,
-        n_genes: int = None,
-        mixup_alpha: float = None,
-        unlabeled_counts: np.ndarray = None,
-        unsup_max_weight: float = 2.,
-        unsup_mean_teacher: bool = False,
-        ssl_method: str = 'mixmatch',
-        ssl_kwargs: dict = {},
-        weighted_classes: bool = False,
-        balanced_classes: bool = False,
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    y: np.ndarray,
+    batch_size: int,
+    n_epochs: int,
+    lr: float,
+    optimizer_name: str,    
+    weight_decay: float,
+    ModelClass: nn.Module,
+    fold_indices: list,
+    out_path: str,
+    n_genes: int = None,
+    mixup_alpha: float = None,
+    unlabeled_counts: np.ndarray = None,
+    unsup_max_weight: float = 2.,
+    unsup_mean_teacher: bool = False,
+    ssl_method: str='mixmatch',
+    ssl_kwargs: dict={},
+    weighted_classes: bool = False,
+    balanced_classes: bool = False,
+    **kwargs,
 ) -> (np.ndarray, np.ndarray):
     '''Perform training using a provided set of training/hold-out
     sample indices.
@@ -715,44 +743,44 @@ def train_cv(
             ModelClass=ModelClass,
             n_genes=n_genes,
             lr=lr,
-            optimizer_name=optimizer_name,
+            optimizer_name=optimizer_name,            
             weight_decay=weight_decay,
             mixup_alpha=mixup_alpha,
             unlabeled_counts=unlabeled_counts,
             unsup_max_weight=unsup_max_weight,
             unsup_mean_teacher=unsup_mean_teacher,
             ssl_method=ssl_method,
-            ssl_kwargs=ssl_kwargs,
+            ssl_kwargs=ssl_kwargs,    
             weighted_classes=weighted_classes,
             balanced_classes=balanced_classes,
             **kwargs,
         )
-
+        
         fold_eval_losses[f] = loss
         fold_eval_acc[f] = acc
     return fold_eval_acc, fold_eval_losses
 
 
 def train_all(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        y: np.ndarray,
-        batch_size: int,
-        n_epochs: int,
-        ModelClass: nn.Module,
-        out_path: str,
-        n_genes: int = None,
-        lr: float = 1.0,
-        optimizer_name: str = 'adadelta',
-        weight_decay: float = None,
-        mixup_alpha: float = None,
-        unlabeled_counts: np.ndarray = None,
-        unsup_max_weight: float = 2.,
-        unsup_mean_teacher: bool = False,
-        ssl_method: str = 'mixmatch',
-        ssl_kwargs: dict = {},
-        weighted_classes: bool = False,
-        balanced_classes: bool = False,
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    y: np.ndarray,
+    batch_size: int,
+    n_epochs: int,
+    ModelClass: nn.Module,
+    out_path: str,
+    n_genes: int = None,
+    lr: float=1.0,
+    optimizer_name: str='adadelta',
+    weight_decay: float = None,
+    mixup_alpha: float = None,
+    unlabeled_counts: np.ndarray = None,
+    unsup_max_weight: float = 2.,
+    unsup_mean_teacher: bool = False,
+    ssl_method: str='mixmatch',
+    ssl_kwargs: dict={},    
+    weighted_classes: bool = False,
+    balanced_classes: bool = False,
+    **kwargs,
 ) -> (float, float):
     '''Perform training using all provided samples.
 
@@ -801,7 +829,7 @@ def train_all(
     # Generate training and model selection indices
     traintest_idx = np.random.choice(
         np.arange(X.shape[0]),
-        size=int(np.floor(0.9 * X.shape[0])),
+        size=int(np.floor(0.9*X.shape[0])),
         replace=False,
     ).astype('int')
     val_idx = np.setdiff1d(
@@ -819,14 +847,14 @@ def train_all(
         out_path=all_out_path,
         n_genes=n_genes,
         lr=lr,
-        optimizer_name=optimizer_name,
+        optimizer_name=optimizer_name,        
         weight_decay=weight_decay,
         mixup_alpha=mixup_alpha,
         unlabeled_counts=unlabeled_counts,
         unsup_max_weight=unsup_max_weight,
         unsup_mean_teacher=unsup_mean_teacher,
         ssl_method=ssl_method,
-        ssl_kwargs=ssl_kwargs,
+        ssl_kwargs=ssl_kwargs,    
         weighted_classes=weighted_classes,
         balanced_classes=balanced_classes,
         **kwargs,
@@ -841,15 +869,15 @@ def train_all(
 
 
 def train_tissue_independent_cv(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        metadata: pd.DataFrame,
-        out_path: str,
-        balanced_classes: bool = False,
-        weighted_classes: bool = False,
-        batch_size: int = 256,
-        n_epochs: int = 200,
-        lower_group: str = 'cell_ontology_class',
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    metadata: pd.DataFrame,
+    out_path: str,
+    balanced_classes: bool = False,
+    weighted_classes: bool = False,
+    batch_size: int = 256,
+    n_epochs: int = 200,
+    lower_group: str = 'cell_ontology_class',
+    **kwargs,
 ) -> None:
     '''
     Trains a cell type classifier that is independent of tissue origin
@@ -885,7 +913,7 @@ def train_tissue_independent_cv(
     '''
 
     print('TRAINING TISSUE INDEPENDENT CLASSIFIER')
-    print('-' * 20)
+    print('-'*20)
     print()
 
     if not os.path.exists(out_path):
@@ -935,8 +963,8 @@ def train_tissue_independent_cv(
     print('Fold eval accuracy')
     print(fold_eval_acc)
     print('Mean %f Std %f' % (fold_eval_losses.mean(), fold_eval_losses.std()))
-    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv', ), fold_eval_losses)
-    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv', ), fold_eval_acc)
+    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv',), fold_eval_losses)
+    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv',), fold_eval_acc)
 
     # Train a model using all available data (after class balancing)
     val_loss, val_acc = train_all(
@@ -955,16 +983,16 @@ def train_tissue_independent_cv(
 
 
 def train_tissue_dependent_cv(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        metadata: pd.DataFrame,
-        out_path: str,
-        balanced_classes: bool = False,
-        weighted_classes: bool = False,
-        batch_size: int = 256,
-        n_epochs: int = 200,
-        upper_group: str = 'tissue',
-        lower_group: str = 'cell_ontology_class',
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    metadata: pd.DataFrame,
+    out_path: str,
+    balanced_classes: bool = False,
+    weighted_classes: bool = False,
+    batch_size: int = 256,
+    n_epochs: int = 200,
+    upper_group: str = 'tissue',
+    lower_group: str = 'cell_ontology_class',
+    **kwargs,
 ) -> None:
     '''
     Trains a cell type classifier conditioned on tissue of origin.
@@ -1003,7 +1031,7 @@ def train_tissue_dependent_cv(
     '''
 
     print('TRAINING TISSUE DEPENDENT CLASSIFIER')
-    print('-' * 20)
+    print('-'*20)
     print()
 
     if not os.path.exists(out_path):
@@ -1064,7 +1092,7 @@ def train_tissue_dependent_cv(
         y=y,
         batch_size=batch_size,
         n_epochs=n_epochs,
-        n_genes=n_genes,  # set n_genes and n_tissues for Conditional model
+        n_genes=n_genes,    # set n_genes and n_tissues for Conditional model
         n_tissues=n_tissues,
         ModelClass=CellTypeCLFConditional,
         fold_indices=kf_indices,
@@ -1079,8 +1107,8 @@ def train_tissue_dependent_cv(
     print('Fold eval accuracy')
     print(fold_eval_acc)
     print('Mean %f Std %f' % (fold_eval_losses.mean(), fold_eval_losses.std()))
-    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv', ), fold_eval_losses)
-    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv', ), fold_eval_acc)
+    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv',), fold_eval_losses)
+    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv',), fold_eval_acc)
 
     # Train a model using all available data (after class balancing)
     val_loss, val_acc = train_all(
@@ -1088,7 +1116,7 @@ def train_tissue_dependent_cv(
         y=y,
         batch_size=batch_size,
         n_epochs=n_epochs,
-        n_genes=n_genes,  # set n_genes and n_tissues for Conditional model
+        n_genes=n_genes,    # set n_genes and n_tissues for Conditional model
         n_tissues=n_tissues,
         ModelClass=CellTypeCLFConditional,
         out_path=out_path,
@@ -1100,16 +1128,16 @@ def train_tissue_dependent_cv(
 
 
 def train_one_tissue_cv(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        metadata: pd.DataFrame,
-        out_path: str,
-        balanced_classes: bool = False,
-        weighted_classes: bool = False,
-        batch_size: int = 256,
-        n_epochs: int = 200,
-        upper_group: str = 'tissue',
-        lower_group: str = 'cell_ontology_class',
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    metadata: pd.DataFrame,
+    out_path: str,
+    balanced_classes: bool = False,
+    weighted_classes: bool = False,
+    batch_size: int = 256,
+    n_epochs: int = 200,
+    upper_group: str = 'tissue',
+    lower_group: str = 'cell_ontology_class',
+    **kwargs,
 ) -> None:
     '''
     Trains a cell type classifier for a single tissue
@@ -1142,7 +1170,7 @@ def train_one_tissue_cv(
     tissue_str = str(list(metadata[upper_group])[0]).lower()
     print('TRAINING %s DEPENDENT CLASSIFIER FOR: ' %
           upper_group.upper(), tissue_str.upper())
-    print('-' * 20)
+    print('-'*20)
     print()
 
     celltypes = sorted(list(set(metadata[lower_group])))
@@ -1179,8 +1207,8 @@ def train_one_tissue_cv(
     print('Fold eval accuracy')
     print(fold_eval_acc)
     print('Mean %f Std %f' % (fold_eval_losses.mean(), fold_eval_losses.std()))
-    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv', ), fold_eval_losses)
-    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv', ), fold_eval_acc)
+    np.savetxt(osp.join(out_path, 'fold_eval_losses.csv',), fold_eval_losses)
+    np.savetxt(osp.join(out_path, 'fold_eval_acc.csv',), fold_eval_acc)
 
     # Train a model using all available data (after class balancing)
     val_loss, val_acc = train_all(
@@ -1191,21 +1219,21 @@ def train_one_tissue_cv(
         ModelClass=CellTypeCLF,
         out_path=out_path,
         weighted_classes=weighted_classes,
-        balanced_classes=balanced_classes,
+        balanced_classes=balanced_classes,        
         **kwargs,
     )
     return
 
 
 def train_tissue_specific_cv(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        metadata: pd.DataFrame,
-        out_path: str,
-        balanced_classes: dict = None,
-        weighted_classes: bool = None,
-        upper_group: str = 'tissue',
-        lower_group: str = 'cell_ontology_class',
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    metadata: pd.DataFrame,
+    out_path: str,
+    balanced_classes: dict = None,
+    weighted_classes: bool = None,
+    upper_group: str = 'tissue',
+    lower_group: str = 'cell_ontology_class',
+    **kwargs,
 ) -> None:
     '''
     Train tissue dependent cell type classifiers for each
@@ -1272,19 +1300,18 @@ def train_tissue_specific_cv(
 
     return
 
-
 #########################################################
 # Predict cell types with a trained model
 #########################################################
 
 
 def predict_cell_types(
-        X: Union[np.ndarray, sparse.csr.csr_matrix],
-        model_path: str,
-        out_path: str,
-        upper_groups: Union[list, np.ndarray] = None,
-        lower_group_labels: list = None,
-        **kwargs,
+    X: Union[np.ndarray, sparse.csr.csr_matrix],
+    model_path: str,
+    out_path: str,
+    upper_groups: Union[list, np.ndarray] = None,
+    lower_group_labels: list = None,
+    **kwargs,
 ) -> None:
     '''Predict cell types using a pretrained model
 
@@ -1355,7 +1382,7 @@ def predict_cell_types(
 
 
 def load_data(
-        path: str,
+    path: str,
 ) -> Union[np.ndarray, sparse.csr.csr_matrix]:
     '''Load a counts matrix from a file path.
 
@@ -1386,7 +1413,6 @@ def load_data(
                          osp.splitext(path)[-1])
 
     return X_raw
-
 
 #########################################################
 # main()
@@ -1452,7 +1478,7 @@ def main():
     parser.add_argument('--residual', action='store_true',
                         help='use residual layers in the model')
     parser.add_argument('--track_running_stats', type=bool, default=True,
-                        help='track running statistics in batch normalization layers')
+                       help='track running statistics in batch normalization layers')
     parser.add_argument('--model_path', type=str, default=None,
                         help='path to pretrained model weights \
                         for class marker identification.')
@@ -1461,7 +1487,7 @@ def main():
     parser.add_argument('--lr', type=float, default=1.0,
                         help='learning rate for the optimizer.')
     parser.add_argument('--optimizer', type=str, default='adadelta',
-                        help='optimizer to use. {adadelta, adam}.')
+                       help='optimizer to use. {adadelta, adam}.')
     parser.add_argument('--l1_reg', type=float, default=1e-4,
                         help='l1 regularization strength \
                         for class marker identification')
@@ -1546,9 +1572,9 @@ def main():
         X = X_raw
 
     # Load metadata and identify output classes
-    metadata = pd.read_csv(args.training_metadata, )
+    metadata = pd.read_csv(args.training_metadata,)
     lower_groups = np.unique(metadata[args.lower_group]).tolist()
-
+    
     # load domain labels if applicable
     if args.input_domain_group is not None:
         if args.input_domain_group not in metadata.columns:
@@ -1563,7 +1589,7 @@ def main():
     if args.unlabeled_counts is not None:
         unlabeled_counts = load_data(args.unlabeled_counts)
         print('%d cells, %d genes in unlabeled data.' % unlabeled_counts.shape)
-
+        
         # parse any semi-supervised learning specific parameters
         if args.ssl_config is not None:
             print(f'Loading Semi-Supervised Learning parameters for {args.ssl_method}')
@@ -1575,7 +1601,7 @@ def main():
             print()
         else:
             ssl_kwargs = {}
-
+        
     else:
         unlabeled_counts = None
         ssl_kwargs = {}
@@ -1608,9 +1634,9 @@ def main():
         os.mkdir(args.out_path)
 
     sub_dirs = [
-        'tissues',
+        'tissues', 
         'tissue_independent_no_dropout',
-        'tissue_dependent',
+        'tissue_dependent', 
         'tissue_ind_class_optimums',
     ]
     for sd in sub_dirs:
@@ -1719,7 +1745,7 @@ def main():
             ssl_method=args.ssl_method,
             input_domain=input_domain,
             unlabeled_domain=unlabeled_domain,
-        )
+         )
 
     #####################################
     # PRETRAINED MODEL PREDICTION
@@ -1756,4 +1782,5 @@ def main():
 
 
 if __name__ == '__main__':
+
     main()

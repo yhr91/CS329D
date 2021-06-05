@@ -1,17 +1,25 @@
-import copy
-import os
-from typing import Callable
-
 import numpy as np
+import os
+import os.path as osp
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-
+import json
+from typing import Callable
 from .dataprep import SampleMixUp
-from .model import CellTypeCLF, DANN
 from .utils import compute_entropy_of_mixing
+from .model import CellTypeCLF, DANN
+import copy
+from torch.utils.tensorboard import SummaryWriter
+from itertools import cycle
 
+
+def reconstruction_loss(decoded, x):
+    loss_func = torch.nn.MSELoss()
+    loss_rcn = loss_func(decoded, x)
+    # print('Reconstruction {}'.format(loss_rcn))
+
+    return loss_rcn
 
 class Trainer(object):
     '''
@@ -52,23 +60,23 @@ class Trainer(object):
     '''
 
     def __init__(
-            self,
-            model: nn.Module,
-            criterion: Callable,
-            optimizer: torch.optim.Optimizer,
-            dataloaders: dict,
-            out_path: str,
-            batch_transformers: dict = {},
-            n_epochs: int = 50,
-            min_epochs: int = 0,
-            patience: int = None,
-            exp_name: str = '',
-            reg_criterion: Callable = None,
-            use_gpu: bool = torch.cuda.is_available(),
-            verbose: bool = False,
-            save_freq: int = 10,
-            scheduler: torch.optim.lr_scheduler = None,
-            tb_writer: str = None,
+        self,
+        model: nn.Module,
+        criterion: Callable,
+        optimizer: torch.optim.Optimizer,
+        dataloaders: dict,
+        out_path: str,
+        batch_transformers: dict = {},
+        n_epochs: int = 50,
+        min_epochs: int = 0,
+        patience: int = None,
+        exp_name: str = '',
+        reg_criterion: Callable = None,
+        use_gpu: bool = torch.cuda.is_available(),
+        verbose: bool = False,
+        save_freq: int = 10,
+        scheduler: torch.optim.lr_scheduler = None,
+        tb_writer: str = None,
     ) -> None:
         '''
         Trains a PyTorch `nn.Module` object provided in `model`
@@ -134,6 +142,7 @@ class Trainer(object):
         self.best_loss = 1.0e10
         self.scheduler = scheduler
         self.reg_criterion = reg_criterion
+        self.epochs_pretrain = 0
         if tb_writer is not None:
             self.tb_writer = SummaryWriter(log_dir=tb_writer)
             os.makedirs(tb_writer, exist_ok=True)
@@ -143,7 +152,7 @@ class Trainer(object):
         if not os.path.exists(self.out_path):
             os.mkdir(self.out_path)
         # initialize log
-
+        
         self.log_path = os.path.join(
             self.out_path, '_'.join([exp_name, 'log.csv']))
         with open(self.log_path, 'w') as f:
@@ -172,6 +181,40 @@ class Trainer(object):
         with open(self.log_path, 'w') as f:
             header = 'Epoch,Iter,Running_Loss,Mode\n'
             f.write(header)
+
+    def pretrain(self):
+        """
+        Pretraining model with autoencoder.
+        optim: optimizer
+        """
+        optim = torch.optim.Adam(params=list(self.model.encoder.parameters()),
+                                 lr=0.001)
+        print('Pretraining..')
+        for _ in range(self.epochs_pretrain):
+            for it, batch in enumerate(self.dataloaders['train']):
+                print(it)
+                x = batch['input'].cuda()
+                _, decoded = self.model(x)
+                loss = reconstruction_loss(decoded, x)
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+            for it, batch in enumerate(self.dataloaders['val']):
+                print(it)
+                x = batch['input'].cuda()
+                _, decoded = self.model(x)
+                loss = reconstruction_loss(decoded, x)
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+        # Freeze pretrained layers
+        #freeze_layers = [0, 1, 2]
+        freeze_layers = []
+        for l in freeze_layers:
+            self.model.encoder[l].requires_grad_(False)
+        return
 
     def train_epoch(self):
         '''Perform training across one full iteration through
@@ -205,7 +248,7 @@ class Trainer(object):
             self.optimizer.zero_grad()
 
             # forward pass
-            outputs = self.model(inputs)
+            outputs = self.model(inputs)[0]
             # predictions are the output nodes with
             # the highest values
             _, predictions = torch.max(outputs, 1)
@@ -239,7 +282,7 @@ class Trainer(object):
             if i % 100 == 0 and self.verbose:
                 print('Iter : ', i)
                 print('running_loss : ', running_loss / (i + 1))
-                print('running_acc  : ', running_corrects / running_total)
+                print('running_acc  : ', running_corrects/running_total)
                 print('corrects: %f | total: %f' %
                       (running_corrects, running_total))
                 # append to log
@@ -255,7 +298,7 @@ class Trainer(object):
         with open(self.log_path, 'a') as f:
             f.write(str(self.epoch) + ',' + str(i) + ',' +
                     str(running_loss / (i + 1)) + ',train_epoch\n')
-
+        
         if self.tb_writer is not None:
             self.tb_writer.add_scalar('Loss/train', epoch_loss, self.epoch)
             self.tb_writer.add_scalar('Acc/train', epoch_acc, self.epoch)
@@ -269,7 +312,7 @@ class Trainer(object):
                 self.optimizer.state_dict()['param_groups'][0]['lr'],
                 self.epoch,
             )
-
+        
         if self.verbose:
             print('{} Loss : {:.4f}'.format('train', epoch_loss))
             print('{} Acc : {:.4f}'.format('train', epoch_acc))
@@ -305,7 +348,7 @@ class Trainer(object):
             # zero gradients
             self.optimizer.zero_grad()
             # forward pass
-            outputs = self.model(inputs)
+            outputs = self.model(inputs)[0]
             _, predictions = torch.max(outputs, 1)
 
             # remake an integer version of the labels for quick checking
@@ -330,7 +373,7 @@ class Trainer(object):
             if i % 1 == 10 and self.verbose > 1:
                 print('Iter : ', i)
                 print('running_loss : ', running_loss / (i + 1))
-                print('running_acc  : ', running_corrects / running_total)
+                print('running_acc  : ', running_corrects/running_total)
                 print('corrects: %f | total: %f' %
                       (running_corrects, running_total))
                 # append to log
@@ -372,7 +415,7 @@ class Trainer(object):
                 os.path.join(self.out_path, '00_best_model_weights.pkl'),
             )
             print('Saved best weights.')
-
+            
             if hasattr(self, 'dan_criterion'):
                 print('Trainer has a `dan_criterion`.')
                 if self.dan_criterion is not None:
@@ -384,7 +427,7 @@ class Trainer(object):
                             '02_best_dan_weights.pkl',
                         )
                     )
-
+            
             with open(self.log_path, 'a') as f:
                 f.write(
                     str(self.epoch)
@@ -394,7 +437,7 @@ class Trainer(object):
                     + str(running_loss / (i + 1))
                     + ',best_model_weights\n',
                 )
-
+                
             if self.tb_writer is not None:
                 self.tb_writer.add_text(
                     'BestWeights',
@@ -402,7 +445,7 @@ class Trainer(object):
                     self.epoch,
                 )
                 self.tb_writer.flush()
-
+            
         elif (self.epoch % self.save_freq == 0):
             torch.save(
                 self.model.state_dict(),
@@ -413,8 +456,8 @@ class Trainer(object):
                     + '.pkl',
                 ),
             )
-
-        elif self.epoch == (self.n_epochs - 1):
+        
+        elif self.epoch == (self.n_epochs-1):
             torch.save(
                 self.model.state_dict(),
                 os.path.join(
@@ -424,12 +467,12 @@ class Trainer(object):
             )
         if self.verbose:
             print(f'{self.waiting_time} epochs since last best weights.\n')
-
+        
         if self.tb_writer is not None:
             self.tb_writer.add_scalar('Loss/val', epoch_loss, self.epoch)
             self.tb_writer.add_scalar('Acc/val', epoch_acc, self.epoch)
             self.tb_writer.flush()
-
+        
         if self.verbose:
             print('{} Loss : {:.4f}'.format('val', epoch_loss))
             print('{} Acc : {:.4f}'.format('val', epoch_acc))
@@ -437,56 +480,61 @@ class Trainer(object):
                   (running_corrects, running_total))
 
     def train(self):
+        # Add reconstruction pre training
+        self.pretrain()
+
+        # Continue regular training
         for epoch in range(self.n_epochs):
             self.epoch = epoch
-            msg = f'Epoch {epoch}/{self.n_epochs - 1}'
-            p_complete = epoch / self.n_epochs
-            n_bars = int(np.floor(30 * p_complete))
-            msg += '|' + '-' * n_bars + '_' * (30 - n_bars) + '|'
+            msg = f'Epoch {epoch}/{self.n_epochs-1}'
+            p_complete = epoch/self.n_epochs
+            n_bars = int(np.floor(30*p_complete))
+            msg += '|' + '-'*n_bars + '_'*(30-n_bars) + '|'
             # print a new line so the progress bar isn't overwritten
             # on the final stdout
-            end_char = '\n' if epoch == (self.n_epochs - 1) else '\r'
+            end_char = '\n' if epoch == (self.n_epochs-1) else '\r'
             print(msg, end=end_char)
-
+            
             # training epoch
             self.train_epoch()
             # evaluate model
             self.val_epoch()
-
+            
             # update learning rate
             # NOTE: change in `torch>=1.1.0`, `scheduler.step()`
             # is now called AFTER `optimizer.step()`
             if self.scheduler is not None:
                 self.scheduler.step()
-
+                
             if self.waiting_time > self.patience:
                 # we have waited a sufficient number of epochs
                 # to perform early stopping
-                print('>' * 5)
+                print('>'*5)
                 print(f'Early stopping at epoch {self.epoch}')
-                print('>' * 5)
+                print('>'*5)
                 break
 
         self.model.load_state_dict(self.best_model_wts)
-
+        
         if self.tb_writer is not None:
             # close tensorboard writer
             self.tb_writer.flush()
             self.tb_writer.close()
-
+        
         return self.model
 
 
 class SemiSupervisedTrainer(Trainer):
 
     def __init__(
-            self,
-            unsup_criterion: Callable,
-            unsup_dataloader: torch.utils.data.DataLoader,
-            unsup_weight: Callable,
-            dan_criterion: Callable = None,
-            dan_weight: Callable = None,
-            **kwargs,
+        self,
+        unsup_criterion: Callable,
+        unsup_dataloader: torch.utils.data.DataLoader,
+        unsup_weight: Callable,
+        dan_criterion: Callable=None,
+        dan_weight: Callable=None,
+        coarse_map: dict=None,
+        **kwargs,
     ) -> None:
         '''Train a PyTorch model using both a supervised and
         unsupervised loss as described for Interpolation
@@ -522,9 +570,10 @@ class SemiSupervisedTrainer(Trainer):
         if self.dan_criterion is not None:
             print('Using a Domain Adaptation Loss.')
         self.dan_weight = dan_weight
+        self.coarse_map = coarse_map
         return
 
-    def train_epoch(self, ) -> None:
+    def train_epoch(self,) -> None:
         '''
         Perform training using both a supervised and semi-supervised loss.
 
@@ -537,41 +586,54 @@ class SemiSupervisedTrainer(Trainer):
         self.model.train(True)
         i = 0
         running_loss = 0.
-        running_sup_loss = 0.  # supervised loss
-        running_uns_loss = 0.  # unsupervised loss
-        running_dom_loss = 0.  # domain adaptation loss
+        running_sup_loss = 0. # supervised loss
+        running_uns_loss = 0. # unsupervised loss
+        running_dom_loss = 0. # domain adaptation loss
         running_corrects = 0.
         running_total = 0.
 
         btrans = self.batch_transformers.get('train', None)
 
         iter_unsup_dl = iter(self.unsup_dataloader)
-        for data in self.dataloaders['train']:
+        iter_coarse_dl = iter(self.dataloaders['coarse'])
 
+        for data in self.dataloaders['train']:
+        #for coarse_data, data in zip(self.dataloaders['coarse'], cycle(
+        #                             self.dataloaders['train'])):
             ####################################
             # (1) Prepare data and graph
             ####################################
-
+            
             # get unlabeled batch
             unsup_data = next(iter_unsup_dl)
-
+            coarse_data = next(iter_coarse_dl)
+            
             if btrans is not None:
                 data = btrans(data)
-
+            
             if self.use_gpu:
                 # push all the data to the CUDA device
                 data['input'] = data['input'].cuda()
                 data['output'] = data['output'].cuda()
 
+                coarse_data['input'] = coarse_data['input'].cuda()
+                coarse_data['output'] = coarse_data['output'].cuda()
+                
                 unsup_data['input'] = unsup_data['input'].cuda()
+                ## TODO REMOVE
+                unsup_data['output'] = unsup_data['output'].cuda()
 
+        
             # capture gradients on labeled and unlabeled inputs
             # do not store gradients on labels
-            data['input'].requires_grad = True
+            #data['input'].requires_grad = True
             data['output'].requires_grad = False
 
-            unsup_data['input'].requires_grad = True
+            #coarse_data['input'].requires_grad = True
+            coarse_data['output'].requires_grad = False
 
+            unsup_data['input'].requires_grad = True
+            
             # zero gradients across the graph
             self.optimizer.zero_grad()
 
@@ -583,8 +645,10 @@ class SemiSupervisedTrainer(Trainer):
                 model=self.model,
                 unlabeled_sample=unsup_data,
                 labeled_sample=data,
+                coarse_sample=coarse_data,
+                coarse_map=self.coarse_map
             )
-
+            
             # check supervised classification accuracy
             _, predictions = torch.max(sup_outputs, 1)
             int_labels = torch.argmax(data['output'], 1)
@@ -596,7 +660,7 @@ class SemiSupervisedTrainer(Trainer):
                 reg_loss = self.reg_criterion(self.model)
             else:
                 reg_loss = 0.
-
+                
             # compute the domain adaptation loss if desired
             if self.dan_criterion is not None:
                 dan_weight = self.dan_weight(self.epoch)
@@ -610,7 +674,7 @@ class SemiSupervisedTrainer(Trainer):
                     pseudolabel_confidence=pseudolabel_confidence,
                 )
             else:
-                dan_loss = torch.zeros(1, ).float()
+                dan_loss = torch.zeros(1,).float()
                 dan_loss = dan_loss.to(device=sup_loss.device)
                 dan_weight = 0.
 
@@ -619,10 +683,10 @@ class SemiSupervisedTrainer(Trainer):
             ####################################
 
             loss = (
-                    sup_loss
-                    + reg_loss
-                    + (self.unsup_weight(self.epoch) * unsup_loss)
-                    + dan_loss
+                sup_loss 
+                + reg_loss 
+                + (self.unsup_weight(self.epoch) * unsup_loss)
+                + dan_loss
             )
 
             if self.verbose > 1:
@@ -643,7 +707,7 @@ class SemiSupervisedTrainer(Trainer):
             # statistics update
             labeled_n = data['input'].size(0)
             unlabel_n = unsup_data['input'].size(0)
-
+            
             running_loss += loss.item()
             running_sup_loss += sup_loss.item()
             running_uns_loss += unsup_loss.item()
@@ -655,9 +719,9 @@ class SemiSupervisedTrainer(Trainer):
                 print('Iter : ', i)
                 print('running_sup_loss : ', running_sup_loss / (i + 1))
                 print('running_uns_loss : ', running_uns_loss / (i + 1))
-                print('running_dom_loss : ', running_dom_loss / (i + 1))
+                print('running_dom_loss : ', running_dom_loss / (i + 1))                
                 print('running_loss : ', running_loss / (i + 1))
-                print('running_acc  : ', running_corrects / running_total)
+                print('running_acc  : ', running_corrects/running_total)
                 print('corrects: %f | total: %f' %
                       (running_corrects, running_total))
                 # append to log
@@ -671,7 +735,7 @@ class SemiSupervisedTrainer(Trainer):
         epoch_dom_loss = running_dom_loss / len(self.dataloaders['train'])
         epoch_loss = running_loss / len(self.dataloaders['train'])
         epoch_acc = running_corrects / running_total
-
+        
         if self.tb_writer is not None:
             self.tb_writer.add_scalar(
                 'Loss/train', epoch_loss, self.epoch,
@@ -691,11 +755,11 @@ class SemiSupervisedTrainer(Trainer):
             if self.dan_criterion is not None:
                 self.tb_writer.add_scalar(
                     'Loss/domain', epoch_dom_loss, self.epoch,
-                )
+                )            
                 self.tb_writer.add_scalar(
                     'SSL/DomWeight', self.dan_weight(self.epoch), self.epoch,
                 )
-
+                
                 # add embedding
                 dlabel = self.dan_criterion.dlabel.numpy()
                 self.tb_writer.add_embedding(
@@ -704,13 +768,13 @@ class SemiSupervisedTrainer(Trainer):
                     global_step=self.epoch,
                     tag='Embed/DAN',
                 )
-
+                
                 # compute the entropy of mixing
                 dan_embedding = self.dan_criterion.x_embed.numpy()
-
+                
                 eom = compute_entropy_of_mixing(
                     X=dan_embedding,
-                    y=dlabel[:, 0],
+                    y=dlabel[:,0],
                     n_neighbors=100,
                     n_iters=512,
                     n_jobs=-1,
@@ -724,24 +788,24 @@ class SemiSupervisedTrainer(Trainer):
                 self.tb_writer.add_scalar(
                     'SSL/domain_acc', self.dan_criterion.dan_acc, self.epoch,
                 )
-
+                
                 for i, param in enumerate(self.dan_criterion.dann.domain_clf.parameters()):
                     self.tb_writer.add_histogram(
                         f'Grad/domain_clf_{i:04}', param.grad, self.epoch,
                     )
                 self.tb_writer.add_scalar(
-                    'SSL/dan_n_conf_pseudolabels',
+                    'SSL/dan_n_conf_pseudolabels', 
                     self.dan_criterion.n_conf_pseudolabels,
                     self.epoch,
                 )
                 self.tb_writer.add_scalar(
                     'SSL/dan_p_conf_pseudolabels',
-                    self.dan_criterion.n_conf_pseudolabels / self.dan_criterion.n_total_unlabeled,
-                    self.epoch,
+                    self.dan_criterion.n_conf_pseudolabels/self.dan_criterion.n_total_unlabeled,
+                    self.epoch,                    
                 )
 
             self.tb_writer.flush()
-
+                   
             for i, named_mod in enumerate(self.model.classif.named_modules()):
                 module_name = named_mod[0]
                 module = named_mod[1]
@@ -749,7 +813,7 @@ class SemiSupervisedTrainer(Trainer):
                     self.tb_writer.add_histogram(
                         f'Grad/{module_name}/{j:04}', param.grad, self.epoch,
                     )
-
+            
             # add the running confidence scores of unlabeled examples
             # if we're using MixMatch
             if hasattr(self.unsup_criterion, 'running_confidence_scores'):
@@ -769,7 +833,7 @@ class SemiSupervisedTrainer(Trainer):
                 )
                 self.tb_writer.add_scalar(
                     'SSL/p_conf_pseudolabels',
-                    torch.sum(n_conf) / torch.sum(n_total),
+                    torch.sum(n_conf)/torch.sum(n_total),
                     self.epoch,
                 )
                 self.tb_writer.add_scalar(
@@ -779,7 +843,7 @@ class SemiSupervisedTrainer(Trainer):
                 )
                 self.tb_writer.add_histogram(
                     'SSL/dist_p_conf_pseudolabels',
-                    n_conf / n_total,
+                    n_conf/n_total,
                     self.epoch,
                 )
                 self.tb_writer.add_histogram(
@@ -819,7 +883,7 @@ class SemiSupervisedTrainer(Trainer):
 
 
 def get_class_weight(
-        y: np.ndarray,
+    y: np.ndarray,
 ) -> np.ndarray:
     '''Generate relative class weights based on the representation
     of classes in a label vector `y`
@@ -840,20 +904,20 @@ def get_class_weight(
     # find all unique class in y and their counts
     u_classes, class_counts = np.unique(y, return_counts=True)
     # compute class proportions
-    class_prop = class_counts / len(y)
+    class_prop = class_counts/len(y)
     # invert proportions to get class weights
-    class_weight = 1. / class_prop
+    class_weight = 1./class_prop
     # normalize so that the minimum value is 1.
     class_weight = class_weight / class_weight.min()
     return class_weight
 
 
 def cross_entropy(
-        pred_: torch.FloatTensor,
-        label: torch.FloatTensor,
-        class_weight: torch.FloatTensor = None,
-        sample_weight: torch.FloatTensor = None,
-        reduction: str = 'mean',
+    pred_: torch.FloatTensor,
+    label: torch.FloatTensor,
+    class_weight: torch.FloatTensor = None,
+    sample_weight: torch.FloatTensor = None,
+    reduction: str='mean',
 ) -> torch.FloatTensor:
     '''Compute cross entropy loss for prediction outputs
     and potentially non-binary targets.
@@ -896,21 +960,21 @@ def cross_entropy(
     if pred_.size() != label.size():
         msg = f'pred size {pred_.size()} not compatible with label size {label.size()}\n'
         raise ValueError(msg)
-
+        
     if reduction.lower() not in ('mean', 'sum', 'none'):
         raise ValueError(f'{reduction} is not a valid reduction method.')
-
+    
     # Apply softmax transform to predictions and log transform
     pred_log_sm = torch.nn.functional.log_softmax(pred_, dim=1)
     # Compute cross-entropy with the label vector
     samplewise_loss = -1 * torch.sum(label * pred_log_sm, dim=1)
-
+    
     if sample_weight is not None:
         # weight individual samples using sample_weight
         # we squeeze into a single column in-case it had an
         # empty singleton dimension
         samplewise_loss *= sample_weight.squeeze()
-
+        
     if class_weight is not None:
         class_weight = class_weight.to(label.device)
         # weight the losses
@@ -919,10 +983,10 @@ def cross_entropy(
         class_weight = class_weight.repeat(samplewise_loss.size(0), 1)
         # compute an [N,] vector of weights for each samples' loss
         weight_vec, _ = torch.max(
-            class_weight * label,
+            class_weight * label, 
             dim=1,
         )
-
+        
         samplewise_loss = samplewise_loss * weight_vec
     if reduction == 'mean':
         loss = torch.mean(samplewise_loss)
@@ -936,15 +1000,15 @@ def cross_entropy(
 class InterpolationConsistencyLoss(object):
 
     def __init__(
-            self,
-            unsup_criterion: Callable,
-            sup_criterion: Callable,
-            decay_coef: float = 0.9997,
-            mean_teacher: bool = True,
-            augment: Callable = None,
-            teacher_eval: bool = True,
-            teacher_bn_running_stats: bool = None,
-            **kwargs,
+        self,
+        unsup_criterion: Callable,
+        sup_criterion: Callable,
+        decay_coef: float = 0.9997,
+        mean_teacher: bool = True,
+        augment: Callable = None,
+        teacher_eval: bool = True,
+        teacher_bn_running_stats: bool = None,
+        **kwargs,
     ) -> None:
         '''Computes an Interpolation Consistency Loss
         given a trained model and an unlabeled minibatch.
@@ -1027,28 +1091,28 @@ class InterpolationConsistencyLoss(object):
         self.step = 0
         return
 
-    def _update_teacher(self, model: nn.Module, ) -> None:
+    def _update_teacher(self, model: nn.Module,) -> None:
         '''Update the teacher model based on settings'''
         if self.mean_teacher:
             if self.teacher is None:
                 # instantiate the teacher with a copy
                 # of the model
-                self.teacher = copy.deepcopy(model, )
+                self.teacher = copy.deepcopy(model,)
             else:
-                self._update_teacher_params(model, )
+                self._update_teacher_params(model,)
         else:
-            self.teacher = copy.deepcopy(model, )
-
+            self.teacher = copy.deepcopy(model,)
+        
         if self.teacher_eval:
             self.teacher = self.teacher.eval()
-
+            
         if self.teacher_bn_running_stats is not None:
             # enforce our preference for teacher model batch 
             # normalization statistics
             for m in self.teacher.modules():
                 if isinstance(m, nn.BatchNorm1d):
                     m.track_running_stats = self.teacher_bn_running_stats
-
+        
         # check that our parameters are preserved
         if self.teacher_bn_running_stats is not None:
             # enforce our preference for teacher model batch 
@@ -1057,9 +1121,8 @@ class InterpolationConsistencyLoss(object):
                 if isinstance(m, nn.BatchNorm1d):
                     assert m.track_running_stats == self.teacher_bn_running_stats
 
-        return
 
-    def _update_teacher_params(self, model: nn.Module, ) -> None:
+    def _update_teacher_params(self, model: nn.Module,) -> None:
         '''Update parameters in the teacher model using an
         exponential averaging method.
 
@@ -1071,7 +1134,7 @@ class InterpolationConsistencyLoss(object):
         # Per the mean-teacher paper, we use the global average
         # of parameter values until the exponential average is more effective
         # For a `decay_coef ~= 0.997`, this hand-off happens at ~step 333.
-        alpha = min(1 - 1 / (self.step + 1), self.decay_coef)
+        alpha = min(1 - 1 / (self.step+1), self.decay_coef)
         # Perform in-place operations on the teacher parameters to average
         # with the new model parameters
         # Here, we're computing a simple weighted average where alpha is
@@ -1085,10 +1148,10 @@ class InterpolationConsistencyLoss(object):
         return
 
     def __call__(
-            self,
-            model: nn.Module,
-            unlabeled_sample: dict,
-            labeled_sample: dict,
+        self,
+        model: nn.Module,
+        unlabeled_sample: dict,        
+        labeled_sample: dict,
     ) -> torch.FloatTensor:
         '''Takes a model and set of unlabeled samples as input
         and computes the Interpolation Consistency Loss.
@@ -1138,12 +1201,12 @@ class InterpolationConsistencyLoss(object):
         # (0) Update the mean teacher
         ###############################
 
-        self._update_teacher(model, )
+        self._update_teacher(model,)
 
         ###############################
         # (1) Compute Fake Labels
         ###############################
-
+        
         with torch.no_grad():
             fake_y = F.softmax(
                 self.teacher(unlabeled_sample['input']),
@@ -1165,7 +1228,7 @@ class InterpolationConsistencyLoss(object):
             model(mixed_sample['input']),
         )
         assert mixed_output.requires_grad
-
+        
         # set outputs as attributes for later access
         self.mixed_output = mixed_output
         self.mixed_sample = mixed_sample
@@ -1179,11 +1242,11 @@ class InterpolationConsistencyLoss(object):
             mixed_output,
             fake_y,
         )
-
+        
         ###############################
         # (4) Compute supervised loss
         ###############################
-
+        
         if self.augment is not None:
             labeled_sample = self.augment(labeled_sample)
         # move sample to the model device if necessary
@@ -1191,20 +1254,20 @@ class InterpolationConsistencyLoss(object):
             device=next(model.parameters()).device,
         )
         labeled_sample['input'].requires_grad = True
-
+        
         sup_outputs = model(labeled_sample['input'])
         sup_loss = self.sup_criterion(
             sup_outputs,
             labeled_sample['output'],
         )
-
+        
         self.step += 1
         return sup_loss, icl, sup_outputs
-
-
+    
+    
 def sharpen_labels(
-        q: torch.FloatTensor,
-        T: float = 0.5,
+    q: torch.FloatTensor,
+    T: float=0.5,
 ) -> torch.FloatTensor:
     '''Reduce the entropy of a categorical label using a 
     temperature adjustment
@@ -1236,34 +1299,16 @@ def sharpen_labels(
             num_classes=q.size(1),
         )
         return oh
-
+    
     if T == 1.0:
         # no-op
         return q
-
+    
     q = torch.pow(q, 1. / T)
-    q /= torch.sum(q, dim=1, ).reshape(-1, 1)
+    q /= torch.sum(q, dim=1,).reshape(-1, 1)
     return q
 
-
-class OnlySupLoss(object):
-    def __init__(self, criterion):
-        self.criterion= criterion
-        self.running_confidence_scores = [[torch.zeros(1), torch.zeros(1)]]
-
-    def __call__(self,
-                 model: nn.Module,
-                 unlabeled_sample: dict,
-                 labeled_sample: dict,
-                 ) -> (torch.FloatTensor, torch.FloatTensor):
-        data = labeled_sample
-        inputs = data['input']
-        labels = data['output']  # one-hot
-        # forward pass
-        outputs = model(inputs)
-        return self.criterion(outputs, labels), torch.zeros(1, device=outputs.device).float(), outputs
-
-
+    
 class MixMatchLoss(InterpolationConsistencyLoss):
     '''Compute the MixMatch Loss given a batch of labeled
     and unlabeled examples.
@@ -1290,14 +1335,14 @@ class MixMatchLoss(InterpolationConsistencyLoss):
     n_batches_to_store : int
         determines how many batches to keep in `running_confidence_scores`.
     '''
-
+    
     def __init__(
-            self,
-            n_augmentations: int = 2,
-            T: float = 0.5,
-            augment_pseudolabels: bool = True,
-            pseudolabel_min_confidence: float = 0.0,
-            **kwargs,
+        self,
+        n_augmentations: int=2,
+        T: float=0.5,
+        augment_pseudolabels: bool=True,
+        pseudolabel_min_confidence: float=0.0,
+        **kwargs,
     ) -> None:
         '''Compute the MixMatch Loss given a batch of labeled
         and unlabeled examples.
@@ -1331,7 +1376,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         # inherit from IC loss, forcing the SampleMixUp to keep 
         # the identity of the dominant observation in each mixed sample
         super(MixMatchLoss, self).__init__(
-            **kwargs,
+            **kwargs, 
             keep_dominant_obs=True,
         )
         if not callable(self.augment):
@@ -1340,18 +1385,20 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         self.n_augmentations = n_augmentations
         self.augment_pseudolabels = augment_pseudolabels
         self.T = T
-
+        
         self.pseudolabel_min_confidence = pseudolabel_min_confidence
         # keep a running score of the last 50 batches worth of pseudolabel
         # confidence outcomes
         self.n_batches_to_store = 50
         self.running_confidence_scores = []
         return
-
+    
+    
     @torch.no_grad()
     def _generate_labels(
-            self,
-            unlabeled_sample: dict,
+        self,
+        unlabeled_sample: dict,
+        coarse_map: dict
     ) -> torch.FloatTensor:
         '''Generate labels by applying a set of augmentations
         to each unlabeled example and keeping the mean.
@@ -1367,7 +1414,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         for i in range(self.n_augmentations):
             to_augment = {
                 'input': unlabeled_sample['input'].clone(),
-                'output': torch.zeros(1),
+                'output' : torch.zeros(1),
             }
             if self.augment_pseudolabels:
                 # augment the batch before pseudolabeling
@@ -1377,7 +1424,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
             # convert model guess to probability distribution `q`
             # with softmax, prior to considering it a label
             guess = F.softmax(
-                self.teacher(augmented_batch['input']),
+                self.teacher(augmented_batch['input'])[0],
                 dim=1,
             )
             raw_guesses.append(guess)
@@ -1385,12 +1432,27 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         # compute pseudolabels as the mean across all label guesses
         pseudolabels = torch.mean(
             torch.stack(
-                raw_guesses,
+                raw_guesses, 
                 dim=0,
             ),
             dim=0,
         )
 
+        # TODO remove
+        pseudo_pred = np.argmax(pseudolabels.cpu(), 1)
+        pseudo_true = np.argmax(unlabeled_sample['output'].cpu(), 1)
+        fine_acc = np.divide(torch.sum(pseudo_pred == pseudo_true),
+                                       len(pseudolabels)).item()
+
+        coarse_pseudo_pred = np.array([coarse_map[i] for i in pseudo_pred.numpy()])
+        coarse_pseudo_true = np.array([coarse_map[i] for i in pseudo_true.numpy()])
+        coarse_acc = sum(coarse_pseudo_pred == coarse_pseudo_true)/\
+                     len(pseudolabels)
+
+        #print(fine_acc)
+        #print(coarse_acc)
+        #print('------')
+        
         # before sharpening labels, determine if the labels are 
         # sufficiently confidence to use
         highest_conf, likeliest_class = torch.max(
@@ -1414,7 +1476,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
                 highest_conf.detach().cpu(),
             ),
         )
-
+        
         if self.T is not None:
             # sharpen labels
             pseudolabels = sharpen_labels(
@@ -1424,14 +1486,17 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         # ensure pseudolabels aren't attached to the
         # computation graph
         pseudolabels = pseudolabels.detach()
-
+        
         return pseudolabels, confident
-
+    
+    
     def __call__(
-            self,
-            model: nn.Module,
-            unlabeled_sample: dict,
-            labeled_sample: dict,
+        self,
+        model: nn.Module,
+        unlabeled_sample: dict,
+        labeled_sample: dict,
+        coarse_sample: dict,
+        coarse_map: dict
     ) -> (torch.FloatTensor, torch.FloatTensor):
         '''
         Parameters
@@ -1463,50 +1528,51 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         supervised_outputs : torch.FloatTensor
             [Batch, Classes] model outputs for augmented labeled examples.
         '''
-
+        
         ########################################
         # (0) Update the mean teacher
         ########################################
 
-        self._update_teacher(model, )
-
+        self._update_teacher(model,)
+        
         ########################################
         # (1) Generate labels for unlabeled data
         ########################################
-
+        
         pseudolabels, pseudolabel_confidence = self._generate_labels(
-            unlabeled_sample=unlabeled_sample,
+            unlabeled_sample = unlabeled_sample,
+            coarse_map = coarse_map
         )
         # make sure pseudolabels match real label dtype
         # so that they can be concatenated
         pseudolabels = pseudolabels.to(
             dtype=labeled_sample['output'].dtype
         )
-
+        
         ########################################
         # (2) Augment the labeled data
         ########################################
-
+        
         labeled_sample = self.augment(
             labeled_sample,
         )
-
+        
         ########################################
         # (3) Perform MixUp across both batches
         ########################################
         n_unlabeled_original = unlabeled_sample['input'].size(0)
         unlabeled_sample['output'] = pseudolabels
-
+        
         # separate samples into confident and unconfident sample dicts
         # we only allow samples with confident pseudolabels to 
         # participate in the MixUp operation
         conf_unlabeled_sample = {}
         ucnf_unlabeled_sample = {}
-
+        
         for k in unlabeled_sample.keys():
             conf_unlabeled_sample[k] = unlabeled_sample[k][pseudolabel_confidence]
             ucnf_unlabeled_sample[k] = unlabeled_sample[k][~pseudolabel_confidence]
-
+        
         # unlabeled samples come BEFORE labeled samples
         # in the concatenated sample
         # NOTE: we only allow confident unlabeled samples
@@ -1520,7 +1586,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
                 dim=0,
             ) for k in ['input', 'output']
         }
-
+        
         # mixup the concatenated sample
         # NOTE: dominant observations are maintained
         # by passing `keep_dominant_obs=True` in
@@ -1528,20 +1594,20 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         mixed_samples = self.mixup_op(
             cat_sample,
         )
-
+        
         ########################################
         # (4) Forward pass for mixed samples
         ########################################
-
+        
         # split the mixed samples based on the dominant
         # observation
         n_unlabeled = conf_unlabeled_sample['input'].size(0)
         unlabeled_m_ = mixed_samples['input'][:n_unlabeled]
         unlabeled_y_ = mixed_samples['output'][:n_unlabeled]
-
+        
         labeled_m_ = mixed_samples['input'][n_unlabeled:]
         labeled_y_ = mixed_samples['output'][n_unlabeled:]
-
+        
         # append low confidence samples to unlabeled_m_ and unlabeled_y_
         # this ensures that batch norm is still able to update it's
         # statistics based on batches from the train AND target domain
@@ -1552,23 +1618,27 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         unlabeled_y_ = torch.cat([
             unlabeled_y_,
             ucnf_unlabeled_sample['output'],
-        ])
-
+        ])          
+        
         # perform a forward pass on mixed samples
         # NOTE: Our unsupervised criterion operates on post-softmax
         # probability vectors, so we transform the output here
         unlabeled_z_ = F.softmax(
-            model(unlabeled_m_),
+            model(unlabeled_m_)[0],
             dim=1,
         )
         # NOTE: Our supervised criterion operates directly on
         # logits and performs a `logsoftmax()` internally
-        labeled_z_ = model(labeled_m_)
+        labeled_z_ = model(labeled_m_)[0]
 
+        # Coarse classification loss
+        coarse_z_ = model(coarse_sample['input'])[2]
+        coarse_y_ = coarse_sample['output']
+        
         ########################################
         # (5) Compute losses
         ########################################
-
+        
         # compare mixed pseudolabels to the model guess
         # on the mixed input
         # NOTE: this returns an **unreduced** loss of size 
@@ -1589,7 +1659,7 @@ class MixMatchLoss(InterpolationConsistencyLoss):
         scale_vec[:n_unlabeled] += 1.
         unsupervised_loss = unsupervised_loss * scale_vec
         unsupervised_loss = torch.mean(unsupervised_loss)
-
+        
         # compute model guess on the mixed supervised input
         # to the mixed labels
         # NOTE: we didn't allow non-confident pseudolabels 
@@ -1600,22 +1670,29 @@ class MixMatchLoss(InterpolationConsistencyLoss):
             labeled_y_,
         )
 
+        coarse_supervised_loss = self.sup_criterion(
+            coarse_z_,
+            coarse_y_,
+        )
+
+        supervised_loss += min(coarse_supervised_loss, supervised_loss)
+        
         self.step += 1
-
+        #unsupervised_loss = unsupervised_loss - unsupervised_loss
         return supervised_loss, unsupervised_loss, labeled_z_
-
-
+    
+    
 class DANLoss(object):
     '''Compute a domain adaptation network (DAN) loss.'''
-
+    
     def __init__(
-            self,
-            dan_criterion: Callable,
-            model: CellTypeCLF,
-            use_conf_pseudolabels: bool = False,
-            scale_loss_pseudoconf: bool = False,
-            n_domains: int = 2,
-            **kwargs,
+        self,
+        dan_criterion: Callable,
+        model: CellTypeCLF,
+        use_conf_pseudolabels: bool=False,
+        scale_loss_pseudoconf: bool=False,
+        n_domains: int=2,
+        **kwargs,
     ) -> None:
         '''Compute a domain adaptation network loss.
         
@@ -1648,7 +1725,7 @@ class DANLoss(object):
         scnym.model.DANN
         '''
         self.dan_criterion = dan_criterion
-
+        
         # build the DANN
         self.dann = DANN(
             model=model,
@@ -1660,18 +1737,18 @@ class DANLoss(object):
         )
         # instantiate with small tensor to simplify downstream size
         # checking logic
-        self.x_embed = torch.zeros((1, 1))
-
+        self.x_embed = torch.zeros((1,1))
+        
         self.use_conf_pseudolabels = use_conf_pseudolabels
         self.scale_loss_pseudoconf = scale_loss_pseudoconf
         return
-
+    
     def __call__(
-            self,
-            labeled_sample: dict,
-            unlabeled_sample: dict,
-            weight: float,
-            pseudolabel_confidence: torch.Tensor = None,
+        self,
+        labeled_sample: dict,
+        unlabeled_sample: dict,
+        weight: float,
+        pseudolabel_confidence: torch.Tensor=None,
     ) -> torch.FloatTensor:
         '''Compute the domain adaptation loss on a labeled source
         and unlabeled target domain batch.
@@ -1705,11 +1782,11 @@ class DANLoss(object):
         dan_loss : torch.FloatTensor
             domain adversarial loss term.
         '''
-
+        
         ########################################
         # (1) Create domain labels
         ########################################
-
+        
         # check if domain labels are provided, if not assume
         # train and target are separate domains
         # domain labels of -1 indicate `None` was passed as a domain label
@@ -1717,31 +1794,31 @@ class DANLoss(object):
         if torch.sum(labeled_sample.get('domain', torch.Tensor([-1])) == -1) > 0:
             source_label = torch.zeros(labeled_sample['input'].size(0)).long()
             source_label = torch.nn.functional.one_hot(
-                source_label,
+                source_label, 
                 num_classes=2,
             )
         else:
             # domain labels should already by one-hot
             source_label = labeled_sample['domain']
         source_label = source_label.to(device=labeled_sample['input'].device)
-
+        
         if torch.sum(unlabeled_sample.get('domain', torch.Tensor([-1])) == -1) > 0:
             target_label = torch.ones(unlabeled_sample['input'].size(0)).long()
             target_label = torch.nn.functional.one_hot(
-                target_label,
+                target_label, 
                 num_classes=2,
             )
         else:
             target_label = unlabeled_sample['domain']
         target_label = target_label.to(device=unlabeled_sample['input'].device)
-
+        
         lx = labeled_sample['input']
         ux = unlabeled_sample['input']
-
+        
         ########################################
         # (2) Check confidence of unlabeled obs
         ########################################
-
+        
         if self.use_conf_pseudolabels and pseudolabel_confidence is not None:
             # check confidence of unlabeled observations and remove
             # any unconfident observations from the minibatch
@@ -1754,41 +1831,41 @@ class DANLoss(object):
         ########################################
         # (3) Embed points and Classify domains
         ########################################
-
-        x = torch.cat([lx, ux], 0)
+        
+        x = torch.cat([lx,ux], 0)
         dlabel = torch.cat([source_label, target_label], 0)
-
+        
         self.dann.set_rev_grad_weight(weight=weight)
         domain_pred, x_embed = self.dann(x)
-
+        
         # store embeddings and labels
         if x_embed.size(0) >= self.x_embed.size(0):
             self.x_embed = copy.copy(
                 x_embed.detach().cpu()
             )
-            self.dlabel = copy.copy(
-                dlabel.detach().cpu()
+            self.dlabel  = copy.copy(
+                dlabel.detach().cpu()         
             )
-
+        
         ########################################
         # (4) Compute DAN loss
         ########################################
-
+        
         dan_loss = self.dan_criterion(
             domain_pred,
             dlabel,
         )
-
+        
         ########################################
         # (5) Compute DAN accuracy for logs
         ########################################
-
+        
         _, dan_pred = torch.max(domain_pred, dim=1)
         _, dlabel_int = torch.max(dlabel, dim=1)
         self.dan_acc = torch.sum(
             dan_pred == dlabel_int,
         ) / float(dan_pred.size(0))
-
+        
         if self.scale_loss_pseudoconf:
             dan_loss *= p_conf_pseudolabels
 
@@ -1801,11 +1878,11 @@ class DANLoss(object):
 class ICLWeight(object):
 
     def __init__(
-            self,
-            ramp_epochs: int,
-            burn_in_epochs: int = 0,
-            max_unsup_weight: float = 10.0,
-            sigmoid: bool = False,
+        self,
+        ramp_epochs: int,
+        burn_in_epochs: int = 0,
+        max_unsup_weight: float = 10.0,
+        sigmoid: bool = False,
     ) -> None:
         '''Schedules the interpolation consistency loss 
         weights across a set of epochs.
@@ -1838,26 +1915,26 @@ class ICLWeight(object):
         print('Scaling ICL over %d epochs, %d epochs for burn in.'
               % (self.ramp_epochs, self.burn_in_epochs))
         return
-
+    
     def _get_weight(
-            self,
-            epoch: int,
+        self,
+        epoch: int,
     ) -> float:
         '''Compute the current weight'''
         if epoch >= (self.ramp_epochs + self.burn_in_epochs):
             weight = self.max_unsup_weight
         elif self.sigmoid:
             x = (epoch - self.burn_in_epochs) / self.ramp_epochs
-            coef = np.exp(-5 * (x - 1) ** 2)
+            coef = np.exp(-5 * (x-1)**2)
             weight = coef * self.max_unsup_weight
         else:
-            weight = self.step_size * (epoch - self.burn_in_epochs)
-
+            weight = self.step_size*(epoch-self.burn_in_epochs)
+            
         return weight
 
     def __call__(
-            self,
-            epoch: int,
+        self, 
+        epoch: int,
     ) -> float:
         '''Compute the weight for an unsupervised IC loss
         given the epoch.
