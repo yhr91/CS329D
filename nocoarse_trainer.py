@@ -14,9 +14,14 @@ import sys
 sys.path.append('../')
 from datetime import datetime
 
+<<<<<<< HEAD
+import scnym
+from scnym.api import scnym_api
+=======
 # import scnym
 from scnym_orig import scnym
 from scnym_orig.scnym.api import scnym_api
+>>>>>>> 5b0d5492fdcd5a4715639f19710650fbc40b3281
 import torch
 
 # file downloads
@@ -48,7 +53,11 @@ def decode_bytes_h5ad(adata):
 
 for it in range(5):
 
+<<<<<<< HEAD
+	adata = sc.read_h5ad('./data'+name+'.h5ad')
+=======
 	adata = sc.read_h5ad('/dfs/user/yhr/CS329D/training_sets/'+name+'.h5ad')
+>>>>>>> 5b0d5492fdcd5a4715639f19710650fbc40b3281
 	adata = decode_bytes_h5ad(adata)
 
 	augment = []

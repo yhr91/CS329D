@@ -49,7 +49,11 @@ def decode_bytes_h5ad(adata):
 
 for it in range(1):
 
+<<<<<<< HEAD
+	adata = sc.read_h5ad('./data/'+name+'.h5ad')
+=======
 	adata = sc.read_h5ad('/dfs/user/yhr/CS329D/training_sets/'+name+'.h5ad')
+>>>>>>> 5b0d5492fdcd5a4715639f19710650fbc40b3281
 	adata = decode_bytes_h5ad(adata)
 
 	augment = []
