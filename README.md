@@ -33,3 +33,11 @@ To produce plots run the following Jupyter notebook
 ```
 Notebooks/scnym_atlas_transfer-hpbmc-run.ipynb
 ```
+
+### CycleGAN
+
+to reproduce results, run
+```bash
+python bioTrain.py --gpu_ids=[*gpu -ids here*]
+```
+Then go through scnym_atlas_transfer_cycleGAN.ipynb and run cells
