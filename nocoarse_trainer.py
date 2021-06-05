@@ -15,8 +15,8 @@ sys.path.append('../')
 from datetime import datetime
 
 # import scnym
-import scnym_SSL_files as scnym
-from scnym_SSL_files.api import scnym_api
+from scnym_orig import scnym
+from scnym_orig.scnym.api import scnym_api
 import torch
 
 # file downloads
@@ -28,8 +28,7 @@ import os
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-name = 'sc_1'
-scenario = 'coarse_MixMatch'
+name = 'raw'
 
 def decode_bytes_h5ad(adata):
 
@@ -47,7 +46,7 @@ def decode_bytes_h5ad(adata):
             continue
     return adata
 
-for it in range(1):
+for it in range(5):
 
 	adata = sc.read_h5ad('/dfs/user/yhr/CS329D/training_sets/'+name+'.h5ad')
 	adata = decode_bytes_h5ad(adata)
@@ -75,31 +74,25 @@ for it in range(1):
 	model_genes = np.loadtxt('./model_genes.csv', dtype='str')
 
 	dt = str(datetime.now())[5:19].replace(' ', '_').replace(':', '-')
-	model_name = '/dfs/user/yhr/CS329D/training_sets/results_map_dict_'+name+'_'+scenario+'_'+dt
+	model_name = '/dfs/user/yhr/CS329D/training_sets/results_map_dict_'+name+'_'+dt
 	print('Training '+model_name)
 
 	scnym_api(
-	adata=adata,
-	full_adata=adata,
-	task='train',
-	groupby='annotations',
-	out_path='./scnym_outputs/' + name +scenario,
-	config='no_ssl',
-        )
+	    adata=adata,
+	    task='train',
+	    groupby='annotations',
+	    out_path='./scnym_outputs/' + name,
+	    config='no_ssl',
+	)
 
 	#subset_adata = adata[adata.obs['augmented'] != True]
 
-	coarse_adata = adata[~adata.obs['coarse_y'].isna()]
-	num_coarse_labels = len(np.unique(coarse_adata.obs['coarse_y']))
-
 	scnym_api(
-	    adata=adata,
-            full_adata=adata,
+	    adata=target_adata,
 	    task='predict',
 	    key_added='scNym',
 	    config='no_new_identity',
-	    num_coarse_labels=num_coarse_labels,
-            trained_model='./scnym_outputs/' + name + scenario,
+	    trained_model='./scnym_outputs/' + name,
 	)
 
 	target_adata.write_h5ad(model_name+'.h5ad')
