@@ -32,7 +32,23 @@ from data import create_dataset
 from models import create_model
 from util.visualizer import save_images
 from util import html
+import scanpy as sc
+import anndata
+import scipy
+import torch
+from tqdm import tqdm
+import numpy as np
 
+def r(x):
+    n, embedding_dim = x.shape
+    image_dim = (embedding_dim + embedding_dim % 3) // 3
+    image_width = int(np.ceil(np.sqrt(image_dim)))
+    image_dim = (image_width)**2
+    image = torch.zeros((n, image_dim * 3))
+    image[:, :embedding_dim] += x
+    image = image.reshape(n, 3, image_width, image_width)
+    image = torch.nn.functional.pad(input=image, pad=(1, 1, 1, 1))
+    return image
 
 if __name__ == '__main__':
     opt = TestOptions().parse()  # get test options
@@ -42,7 +58,6 @@ if __name__ == '__main__':
     opt.serial_batches = True  # disable data shuffling; comment this line if results on randomly chosen images are needed.
     opt.no_flip = True    # no flip; comment this line if results on flipped images are needed.
     opt.display_id = -1   # no visdom display; the test code saves the results to a HTML file.
-    dataset = create_dataset(opt)  # create a dataset given opt.dataset_mode and other options
     model = create_model(opt)      # create a model given opt.model and other options
     model.setup(opt)               # regular setup: load and print networks; create schedulers
     # create a website
@@ -54,9 +69,30 @@ if __name__ == '__main__':
     # test with eval mode. This only affects layers like batchnorm and dropout.
     # For [pix2pix]: we use batchnorm and dropout in the original pix2pix. You can experiment it with and without eval() mode.
     # For [CycleGAN]: It should not affect CycleGAN as CycleGAN uses instancenorm without dropout.
+    
+    train_adata = anndata.read_h5ad('/dfs/project/CS329D/train_adata_rat.h5ad',)
+    print('%d cells, %d genes in training data set.' % train_adata.shape)
+    test_adata = anndata.read_h5ad('/dfs/project/CS329D/target_adata_rat.h5ad',)
+    print('%d cells, %d genes in training data set.' % test_adata.shape)
+    train_data = scipy.sparse.csr_matrix.toarray(train_adata.X)
+    test_data = scipy.sparse.csr_matrix.toarray(test_adata.X)
+    train_dataset = torch.utils.data.TensorDataset(torch.Tensor(train_data))
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size = opt.batch_size, shuffle=True, num_workers = 4)
+    test_dataset = torch.utils.data.TensorDataset(torch.Tensor(test_data))
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size = opt.batch_size, shuffle=True, num_workers = 4)
+
     if opt.eval:
         model.eval()
-    for i, data in enumerate(dataset):
+    for i, data1 in tqdm(enumerate(test_loader)):
+
+        try:
+            data2 = next(dataloader_iterator)
+        except StopIteration:
+            dataloader_iterator = iter(train_loader)
+            data2 = next(dataloader_iterator)
+        data = {}
+        data['A'] = r(data1[0])
+        data['B'] = r(data2[0])
         if i >= opt.num_test:  # only apply our model to opt.num_test images.
             break
         model.set_input(data)  # unpack data from data loader

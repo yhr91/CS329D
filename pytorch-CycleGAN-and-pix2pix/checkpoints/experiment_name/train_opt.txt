@@ -1,8 +1,8 @@
 ----------------- Options ---------------
-               batch_size: 1                             
+               batch_size: 32                            
                     beta1: 0.5                           
           checkpoints_dir: ./checkpoints                 
-           continue_train: False                         
+           continue_train: True                          	[default: False]
                 crop_size: 256                           
              dataset_mode: unaligned                     
                 direction: AtoB                          
@@ -14,9 +14,9 @@
            display_server: http://localhost              
           display_winsize: 256                           
                     epoch: latest                        
-              epoch_count: 1                             
+              epoch_count: 30                            	[default: 1]
                  gan_mode: lsgan                         
-                  gpu_ids: 0                             
+                  gpu_ids: 6,7,8,9                       	[default: 0]
                 init_gain: 0.02                          
                 init_type: normal                        
                  input_nc: 3                             
